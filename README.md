@@ -431,3 +431,12 @@ A: Yes. Target column names are auto-detected case-insensitively (pKd / pKi / af
 
 **Q: Does it work on Windows?**
 A: The code is cross-platform, but hard links may fall back to file copying on some Windows filesystems (no impact on functionality, just uses more disk space). Linux is recommended.
+
+---
+
+## Contact
+
+For questions, issues, or feedback, feel free to reach out. **Email is the fastest way to get in touch — I usually respond promptly.**
+
+- **Email**: [2681875077@qq.com](mailto:2681875077@qq.com)
+- **GitHub**: [why-assert](https://github.com/why-assert)
