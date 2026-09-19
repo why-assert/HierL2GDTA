@@ -308,10 +308,6 @@ python src/train.py \
     --use_amp
 ```
 
-Two directory layouts are supported:
-- **Per-split subdirectories**: `cache_root/train/a_0.pt` etc. (recommended, matches `extract_features.py` output)
-- **Flat directory**: `cache_root/a_0.pt` etc. (legacy format)
-
 ### 5.5 Data Recommendations
 
 - **SMILES**: recommended length ≤ 300; very long sequences may be truncated
