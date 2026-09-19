@@ -1,22 +1,27 @@
 """
-Davis dataset preprocessing script.
+Davis dataset preprocessing script (PaddleHelix raw format).
 
-Converts raw Davis CSV to a filtered CSV with pKd values.
+Converts the raw Davis dataset from PaddleHelix (ligands_can.txt +
+proteins.txt + affinity matrix) into a filtered CSV with pKd values.
 
 Usage:
     python davis/davis.py \
-        --input davis.csv \
-        --output davis_filtered.csv \
-        --max-smiles-length 300
+        --input_dir davis/davis \
+        --output davis/davis_filtered.csv
 
-Automatically detects column names (drug_id, protein_id, smiles, protein,
-affinity, etc.), drops missing values, canonicalizes SMILES, deduplicates
-by drug_id + protein_id, and converts affinity to pKd.
+Input directory should contain:
+    ligands_can.txt   - one canonical SMILES per line
+    proteins.txt      - one protein sequence per line
+    Y                 - affinity matrix (Kd in nM), shape (n_drugs, n_proteins)
+                        (can be .txt or no extension)
+
+Output columns: drug_id, protein_id, smiles, protein, pKd
 """
 
 import argparse
 import os
 import warnings
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -29,434 +34,274 @@ warnings.filterwarnings("ignore")
 RDLogger.DisableLog("rdApp.*")
 tqdm.pandas()
 
+
 def print_filter_result(step_name, before_count, after_count):
-    """
-    Print the number of removed and retained records.
-    """
-    removed_count = before_count - after_count
-
-    if before_count == 0:
-        percentage = 0.0
-    else:
-        percentage = removed_count / before_count * 100
-
+    """Print the number of removed and retained records."""
+    removed = before_count - after_count
+    pct = removed / before_count * 100 if before_count > 0 else 0.0
     print(
         f"[{step_name}] "
-        f"removed: {removed_count}, "
-        f"retained: {after_count}/{before_count}, "
-        f"removed percentage: {percentage:.3f}%"
+        f"removed: {removed}, retained: {after_count}/{before_count}, "
+        f"removed percentage: {pct:.3f}%"
     )
 
-def find_column(df, candidates, column_type):
-    """
-    Find the first existing column from candidates.
-    """
-    for column in candidates:
-        if column in df.columns:
-            return column
 
-    raise ValueError(
-        f"Cannot find {column_type} column.\n"
-        f"Supported names: {candidates}\n"
-        f"Current columns: {list(df.columns)}"
-    )
+def load_davis_raw(input_dir):
+    """
+    Load raw Davis dataset from PaddleHelix format.
 
-def load_csv(input_file):
+    Reads ligands_can.txt, proteins.txt, and the affinity matrix Y,
+    then converts to long-format DataFrame.
     """
-    Load the input CSV file.
-    """
-    if not os.path.exists(input_file):
+    input_dir = Path(input_dir)
+
+    # --- Load ligands ---
+    ligands_file = input_dir / "ligands_can.txt"
+    if not ligands_file.exists():
+        for alt in ["ligands.txt"]:
+            if (input_dir / alt).exists():
+                ligands_file = input_dir / alt
+                break
+
+    if not ligands_file.exists():
         raise FileNotFoundError(
-            f"Input file does not exist: {input_file}"
+            f"Cannot find ligands file in {input_dir}. "
+            f"Expected: ligands_can.txt or ligands.txt"
         )
 
-    df = pd.read_csv(input_file)
+    # Try JSON dict format first (PaddleHelix format: {drug_id: smiles})
+    try:
+        import json
+        with open(ligands_file, "r") as f:
+            ligands_dict = json.load(f)
+        if isinstance(ligands_dict, dict):
+            drug_ids = list(ligands_dict.keys())
+            ligands = list(ligands_dict.values())
+            print(f"Loaded {len(ligands)} ligands from {ligands_file.name} (JSON dict format)")
+        else:
+            raise ValueError("Not a dict")
+    except Exception:
+        # Fallback: one SMILES per line
+        with open(ligands_file, "r") as f:
+            ligands = [line.strip() for line in f if line.strip()]
+        drug_ids = [f"D{i+1}" for i in range(len(ligands))]
+        print(f"Loaded {len(ligands)} ligands from {ligands_file.name} (line format)")
 
-    print(f"Input file: {input_file}")
-    print(f"Original records: {len(df)}")
-    print(f"Original columns: {list(df.columns)}")
+    # --- Load proteins ---
+    proteins_file = input_dir / "proteins.txt"
+    if not proteins_file.exists():
+        raise FileNotFoundError(
+            f"Cannot find proteins.txt in {input_dir}"
+        )
 
-    if len(df) == 0:
-        raise ValueError("The input CSV file is empty.")
+    # Try JSON dict format first (PaddleHelix format: {protein_id: sequence})
+    try:
+        import json
+        with open(proteins_file, "r") as f:
+            proteins_dict = json.load(f)
+        if isinstance(proteins_dict, dict):
+            protein_ids = list(proteins_dict.keys())
+            proteins = list(proteins_dict.values())
+            print(f"Loaded {len(proteins)} proteins from proteins.txt (JSON dict format)")
+        else:
+            raise ValueError("Not a dict")
+    except Exception:
+        # Fallback: one sequence per line
+        with open(proteins_file, "r") as f:
+            proteins = [line.strip() for line in f if line.strip()]
+        protein_ids = [f"P{i+1}" for i in range(len(proteins))]
+        print(f"Loaded {len(proteins)} proteins from proteins.txt (line format)")
 
-    return df
+    # --- Load affinity matrix ---
+    y_file = None
+    for candidate in ["Y", "Y.txt", "mat_drug_protein.txt", "affinity.txt"]:
+        if (input_dir / candidate).exists():
+            y_file = input_dir / candidate
+            break
 
-def select_and_rename_columns(df):
-    """
-    Select and rename the required columns.
+    if y_file is None:
+        raise FileNotFoundError(
+            f"Cannot find affinity matrix in {input_dir}. "
+            f"Expected: Y, Y.txt, mat_drug_protein.txt, or affinity.txt"
+        )
 
-    Expected columns from the previously generated CSV:
+    # Try multiple formats: pickle (Python2 numpy), npy, text
+    try:
+        # Try pickle first (PaddleHelix Davis uses Python2 pickle format)
+        with open(y_file, "rb") as f:
+            import pickle
+            affinity_matrix = pickle.load(f, encoding="latin1")
+        if not isinstance(affinity_matrix, np.ndarray):
+            affinity_matrix = np.array(affinity_matrix)
+    except Exception:
+        try:
+            # Try np.load (npy format)
+            affinity_matrix = np.load(str(y_file), allow_pickle=True)
+        except Exception:
+            try:
+                # Try text format
+                affinity_matrix = np.loadtxt(str(y_file))
+            except Exception:
+                # Try pandas as last resort
+                affinity_matrix = pd.read_csv(
+                    y_file, sep=None, engine="python", header=None
+                ).values
 
-        drug_id
-        drug
-        protein_id
-        protein
-        affinity
-    """
+    print(f"Loaded affinity matrix from {y_file.name}, shape: {affinity_matrix.shape}")
 
-    # For the generated Davis CSV, "drug" is the SMILES column.
-    smiles_column = find_column(
-        df,
-        [
-            "drug",
-            "smiles",
-            "SMILES",
-            "drug_smiles",
-            "Drug",
-        ],
-        "SMILES",
-    )
+    # Verify dimensions
+    n_drugs, n_prots = affinity_matrix.shape
+    if n_drugs != len(ligands):
+        print(
+            f"Warning: matrix rows ({n_drugs}) != ligands count ({len(ligands)})"
+        )
+    if n_prots != len(proteins):
+        print(
+            f"Warning: matrix cols ({n_prots}) != proteins count ({len(proteins)})"
+        )
 
-    protein_column = find_column(
-        df,
-        [
-            "protein",
-            "Target",
-            "target",
-            "Protein",
-            "protein_sequence",
-        ],
-        "protein",
-    )
+    # --- Convert to long format ---
+    print("Converting matrix to long format...")
+    rows = []
+    for i in range(n_drugs):
+        for j in range(n_prots):
+            affinity = affinity_matrix[i, j]
+            rows.append({
+                "drug_id": drug_ids[i],
+                "protein_id": protein_ids[j],
+                "smiles": ligands[i] if i < len(ligands) else "",
+                "protein": proteins[j] if j < len(proteins) else "",
+                "affinity": affinity,
+            })
 
-    affinity_column = find_column(
-        df,
-        [
-            "affinity",
-            "Kd",
-            "kd",
-            "Ki",
-            "ki",
-            "Y",
-            "y",
-        ],
-        "affinity",
-    )
-
-    drug_id_column = find_column(
-        df,
-        [
-            "drug_id",
-            "Drug_ID",
-            "compound_id",
-            "compound",
-            "drug_index",
-        ],
-        "drug ID",
-    )
-
-    protein_id_column = find_column(
-        df,
-        [
-            "protein_id",
-            "Protein_ID",
-            "target_id",
-            "Target_ID",
-            "protein_index",
-        ],
-        "protein ID",
-    )
-
-    result = df[
-        [
-            drug_id_column,
-            protein_id_column,
-            smiles_column,
-            protein_column,
-            affinity_column,
-        ]
-    ].copy()
-
-    result = result.rename(
-        columns={
-            drug_id_column: "drug_id",
-            protein_id_column: "protein_id",
-            smiles_column: "smiles",
-            protein_column: "protein",
-            affinity_column: "affinity",
-        }
-    )
-
-    print(f"Drug ID column: {drug_id_column}")
-    print(f"Protein ID column: {protein_id_column}")
-    print(f"SMILES column: {smiles_column}")
-    print(f"Protein sequence column: {protein_column}")
-    print(f"Affinity column: {affinity_column}")
-
-    return result
-
-def filter_missing_values(df):
-    """
-    Remove records with missing IDs, SMILES, protein or affinity.
-    """
-    before_count = len(df)
-
-    missing_mask = (
-        df["drug_id"].isna()
-        | df["protein_id"].isna()
-        | df["smiles"].isna()
-        | df["protein"].isna()
-        | df["affinity"].isna()
-    )
-
-    df = df.loc[~missing_mask].copy()
-    df.reset_index(drop=True, inplace=True)
-
-    print_filter_result(
-        "Missing value check",
-        before_count,
-        len(df),
-    )
+    df = pd.DataFrame(rows)
+    print(f"Total pairs: {len(df)}")
 
     return df
 
-def clean_ids_and_sequences(df):
-    """
-    Strip whitespace from IDs and protein sequences.
-    """
-    before_count = len(df)
-
-    for column in ["drug_id", "protein_id", "protein"]:
-        df[column] = df[column].astype(str).str.strip()
-
-    invalid_mask = (
-        (df["drug_id"] == "")
-        | (df["protein_id"] == "")
-        | (df["protein"] == "")
-    )
-
-    df = df.loc[~invalid_mask].copy()
-    df.reset_index(drop=True, inplace=True)
-
-    print_filter_result(
-        "ID and protein text check",
-        before_count,
-        len(df),
-    )
-
-    return df
 
 def standardize_smiles(df, max_smiles_length=300):
-    """
-    Standardize SMILES with RDKit.
-
-    Invalid SMILES and SMILES longer than max_smiles_length
-    are removed.
-    """
+    """Standardize SMILES with RDKit. Remove invalid / too long ones."""
     before_count = len(df)
 
-    def convert_one_smiles(smiles):
+    def convert_one(smiles):
         try:
             smiles = str(smiles).strip()
-
             if not smiles:
                 return np.nan
-
-            molecule = Chem.MolFromSmiles(smiles)
-
-            if molecule is None:
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is None:
                 return np.nan
-
-            canonical_smiles = Chem.MolToSmiles(
-                molecule,
-                canonical=True,
-                isomericSmiles=True,
+            canonical = Chem.MolToSmiles(
+                mol, canonical=True, isomericSmiles=True
             )
-
-            if not canonical_smiles:
+            if not canonical or len(canonical) > max_smiles_length:
                 return np.nan
-
-            if len(canonical_smiles) > max_smiles_length:
-                return np.nan
-
-            return canonical_smiles
-
+            return canonical
         except Exception:
             return np.nan
 
-    df["smiles"] = df["smiles"].progress_apply(
-        convert_one_smiles
-    )
+    df["smiles"] = df["smiles"].progress_apply(convert_one)
+    df = df.dropna(subset=["smiles"]).reset_index(drop=True)
 
-    invalid_mask = df["smiles"].isna()
-
-    df = df.loc[~invalid_mask].copy()
-    df.reset_index(drop=True, inplace=True)
-
-    print_filter_result(
-        "SMILES standardization",
-        before_count,
-        len(df),
-    )
-
+    print_filter_result("SMILES standardization", before_count, len(df))
     return df
 
-def convert_affinity_to_numeric(df):
-    """
-    Convert affinity values to numeric values.
-    """
+
+def filter_missing_and_invalid(df):
+    """Remove rows with missing protein sequence or invalid affinity."""
     before_count = len(df)
 
-    df["affinity"] = pd.to_numeric(
-        df["affinity"],
-        errors="coerce",
-    )
+    # Check protein
+    df["protein"] = df["protein"].astype(str).str.strip()
+    df = df[df["protein"] != ""]
 
-    invalid_mask = df["affinity"].isna()
+    # Check affinity is numeric and positive
+    df["affinity"] = pd.to_numeric(df["affinity"], errors="coerce")
+    df = df.dropna(subset=["affinity"])
+    df = df[df["affinity"] > 0]
 
-    df = df.loc[~invalid_mask].copy()
-    df.reset_index(drop=True, inplace=True)
-
+    df = df.reset_index(drop=True)
     print_filter_result(
-        "Affinity numeric check",
-        before_count,
-        len(df),
+        "Missing / invalid value check", before_count, len(df)
     )
-
     return df
 
-def filter_non_positive_affinity(df):
-    """
-    Remove affinity values less than or equal to zero.
-    """
-    before_count = len(df)
-
-    invalid_mask = df["affinity"] <= 0
-
-    df = df.loc[~invalid_mask].copy()
-    df.reset_index(drop=True, inplace=True)
-
-    print_filter_result(
-        "Affinity positive-value check",
-        before_count,
-        len(df),
-    )
-
-    return df
-
-def remove_duplicate_records_by_ids(df):
-    """
-    Remove duplicate records only when both IDs are identical.
-
-    Duplicate key:
-        drug_id + protein_id
-
-    The first record is retained.
-    If the same pair has different affinity values,
-    the first record is also retained.
-    """
-    before_count = len(df)
-
-    df = df.drop_duplicates(
-        subset=["drug_id", "protein_id"],
-        keep="first",
-    ).copy()
-
-    df.reset_index(drop=True, inplace=True)
-
-    print_filter_result(
-        "Duplicate ID pair check",
-        before_count,
-        len(df),
-    )
-
-    return df
 
 def convert_to_pkd(df):
-    """
-    Convert Kd in nM to pKd.
-
-    pKd = 9 - log10(Kd[nM])
-    """
+    """Convert Kd (nM) to pKd: pKd = 9 - log10(Kd_nM)"""
     df["pKd"] = 9.0 - np.log10(df["affinity"])
-
     return df
 
-def process_dataset(
-    input_file,
-    output_file,
-    max_smiles_length=300,
-):
-    """
-    Process the complete dataset.
-    """
-    df = load_csv(input_file)
 
-    df = select_and_rename_columns(df)
+def process_dataset(input_dir, output_file, max_smiles_length=300):
+    """Full Davis preprocessing pipeline."""
+    print("=" * 60)
+    print("Davis Dataset Preprocessing")
+    print("=" * 60)
+    print(f"Input directory: {input_dir}")
+    print(f"Output file: {output_file}")
+    print()
 
-    df = filter_missing_values(df)
+    # 1. Load raw data
+    df = load_davis_raw(input_dir)
 
-    df = clean_ids_and_sequences(df)
+    # 2. Filter missing / invalid values
+    df = filter_missing_and_invalid(df)
 
-    df = standardize_smiles(
-        df,
-        max_smiles_length=max_smiles_length,
-    )
+    # 3. Standardize SMILES
+    df = standardize_smiles(df, max_smiles_length=max_smiles_length)
 
-    df = convert_affinity_to_numeric(df)
-
-    df = filter_non_positive_affinity(df)
-
-    # Only drug_id and protein_id are used to identify duplicates.
-    df = remove_duplicate_records_by_ids(df)
-
+    # 4. Convert Kd to pKd
     df = convert_to_pkd(df)
 
-    output_df = df[
-        [
-            "drug_id",
-            "protein_id",
-            "smiles",
-            "protein",
-            "pKd",
-        ]
-    ].copy()
+    # 5. Output
+    output_df = df[["drug_id", "protein_id", "smiles", "protein", "pKd"]].copy()
 
-    output_df.to_csv(
-        output_file,
-        index=False,
-        encoding="utf-8-sig",
-    )
+    os.makedirs(os.path.dirname(output_file) or ".", exist_ok=True)
+    output_df.to_csv(output_file, index=False)
 
     print()
+    print("=" * 60)
     print("Processing completed.")
     print(f"Output file: {output_file}")
     print(f"Final records: {len(output_df)}")
     print(f"Output columns: {list(output_df.columns)}")
+    print(f"pKd range: {output_df['pKd'].min():.3f} ~ {output_df['pKd'].max():.3f}")
+    print("=" * 60)
     print()
     print(output_df.head())
 
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Process Davis CSV and convert Kd to pKd."
+        description="Process Davis dataset (PaddleHelix raw format) to pKd CSV."
     )
-
     parser.add_argument(
-        "--input",
-        default="davis.csv",
-        help="Input CSV file. Default: davis.csv",
+        "--input_dir",
+        default="davis/davis",
+        help="Input directory containing ligands_can.txt, proteins.txt, and Y. "
+             "Default: davis/davis",
     )
-
     parser.add_argument(
         "--output",
-        default="davis_pkd.csv",
-        help="Output CSV file. Default: davis_pkd.csv",
+        default="davis/davis_filtered.csv",
+        help="Output CSV file. Default: davis/davis_filtered.csv",
     )
-
     parser.add_argument(
         "--max-smiles-length",
         type=int,
         default=300,
         help="Maximum SMILES length. Default: 300",
     )
-
     args = parser.parse_args()
 
     process_dataset(
-        input_file=args.input,
+        input_dir=args.input_dir,
         output_file=args.output,
         max_smiles_length=args.max_smiles_length,
     )
+
 
 if __name__ == "__main__":
     main()

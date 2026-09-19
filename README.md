@@ -147,21 +147,32 @@ wget https://baidu-nlp.bj.bcebos.com/PaddleHelix/datasets/dti_datasets/davis_v1.
 tar -xzf davis/davis_v1.tgz -C davis/
 ```
 
-This produces `davis/davis.csv`.
+This extracts to `davis/davis/` containing three files:
+
+| File | Format | Description |
+|------|--------|-------------|
+| `ligands_can.txt` | JSON dict | `{drug_id: canonical_SMILES}` pairs, 68 drugs |
+| `proteins.txt` | JSON dict | `{protein_id: sequence}` pairs, 442 proteins |
+| `Y` | Python2 pickle | Affinity matrix (Kd in nM), shape `[68, 442]` |
+
+The preprocessing script auto-detects these formats.
 
 ### 3.2 BindingDB Dataset (202604 version)
 
-Download `BindingDB_All.tsv` from the [BindingDB website](https://www.bindingdb.org/rwd/bind/chemsearch/marvin/SDFdownload.jsp?all_download=yes) and place it in the `bindingdb/` directory:
+Download `BindingDB_All.tsv` from the [BindingDB download page](https://www.bindingdb.org/rwd/bind/chemsearch/marvin/Download.jsp) and place it in the `bindingdb/` directory:
 
 ```bash
-# Download (check the official site for the latest URL)
-wget "https://www.bindingdb.org/bind/downloads/BindingDB_All_202604.tsv.zip" -P bindingdb/
+# Download the 202604 TSV release (or check the download page for current version)
+curl -L -o bindingdb/BindingDB_All_tsv.zip \
+    "https://www.bindingdb.org/rwd/bind/chemsearch/marvin/SDFdownload.jsp?download_file=/rwd/bind/downloads/BindingDB_All_202604_tsv.zip"
 
 # Extract
-unzip bindingdb/BindingDB_All_202604.tsv.zip -d bindingdb/
+unzip bindingdb/BindingDB_All_tsv.zip -d bindingdb/
 ```
 
 This produces `bindingdb/BindingDB_All.tsv`.
+
+> **Note**: BindingDB releases are versioned by date (e.g., `202604` = April 2026). Older versions may be removed over time. Check the [official download page](https://www.bindingdb.org/rwd/bind/chemsearch/marvin/Download.jsp) if the link above is no longer valid.
 
 ---
 
@@ -193,8 +204,8 @@ python src/train.py \
 ### 4.2 Davis
 
 ```bash
-# 1. Preprocess
-python davis/davis.py --input davis/davis.csv --output davis/davis_filtered.csv
+# 1. Preprocess (PaddleHelix raw format → filtered CSV with pKd)
+python davis/davis.py --input_dir davis/davis --output davis/davis_filtered.csv
 
 # 2. Split (7:2:1, output to data/)
 python tools/split_dataset.py --input davis/davis_filtered.csv --output_dir data/davis
